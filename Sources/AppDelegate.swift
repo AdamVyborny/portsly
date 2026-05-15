@@ -67,6 +67,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pasteboard.setString(value, forType: .string)
     }
 
+    private func displayLabel(for process: ProcessInfo) -> String {
+        guard let suffix = gitInfoValue(for: process) else { return process.name }
+        return "\(process.name) [\(suffix)]"
+    }
+
+    // Worktree directories are often named the same as the branch they hold
+    // (e.g. `git worktree add ../feature feature`); drop the duplicate when so.
+    private func gitInfoValue(for process: ProcessInfo) -> String? {
+        switch (process.gitBranch, process.gitWorktree) {
+        case (let branch?, let worktree?) where worktree != branch:
+            return "\(branch) @ \(worktree)"
+        case (let branch?, _):
+            return branch
+        case (nil, let worktree?):
+            return worktree
+        default:
+            return nil
+        }
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
     }
@@ -254,14 +274,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item)
         } else {
             // Create a map of ports to processes for easier lookup
-            var portToProcesses: [Int: [(name: String, pid: Int, workingDirectory: String?, fullCommand: String?)]] = [:]
+            var portToProcesses: [Int: [ProcessInfo]] = [:]
 
             for process in processes {
                 for port in process.ports {
                     if portToProcesses[port] == nil {
                         portToProcesses[port] = []
                     }
-                    portToProcesses[port]?.append((name: process.name, pid: process.pid, workingDirectory: process.workingDirectory, fullCommand: process.fullCommand))
+                    portToProcesses[port]?.append(process)
                 }
             }
 
@@ -272,7 +292,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let processesOnPort = portToProcesses[port] else { continue }
 
                 // Format the menu item with port on left, process name(s) on right
-                let processNames = processesOnPort.map { $0.name }.joined(separator: ", ")
+                let processNames = processesOnPort.map { displayLabel(for: $0) }.joined(separator: ", ")
                 let title = String(format: "%-8d %@", port, processNames)
 
                 let portItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
@@ -310,15 +330,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                     submenu.addItem(NSMenuItem.separator())
 
-                    for (name, pid, workingDirectory, fullCommand) in processesOnPort {
+                    for process in processesOnPort {
                         submenu.addItem(createInfoMenuItem(
                             title: "PID",
-                            value: String(pid),
+                            value: String(process.pid),
                             font: .systemFont(ofSize: 12),
                             color: .secondaryLabelColor
                         ))
 
-                        if let cwd = workingDirectory {
+                        if let cwd = process.workingDirectory {
                             submenu.addItem(createInfoMenuItem(
                                 title: "Directory",
                                 value: cwd,
@@ -328,7 +348,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             ))
                         }
 
-                        if let cmd = fullCommand {
+                        if let branchValue = gitInfoValue(for: process) {
+                            submenu.addItem(createInfoMenuItem(
+                                title: "Branch",
+                                value: branchValue,
+                                font: .monospacedSystemFont(ofSize: 12, weight: .regular),
+                                color: .secondaryLabelColor
+                            ))
+                        }
+
+                        if let cmd = process.fullCommand {
                             submenu.addItem(createInfoMenuItem(
                                 title: "Command",
                                 value: cmd,
@@ -338,20 +367,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             ))
                         }
 
-                        let killItem = NSMenuItem(title: "Kill \(name)", action: #selector(killProcess(_:)), keyEquivalent: "")
-                        killItem.representedObject = ["pid": pid, "force": false]
+                        let killItem = NSMenuItem(title: "Kill \(process.name)", action: #selector(killProcess(_:)), keyEquivalent: "")
+                        killItem.representedObject = ["pid": process.pid, "force": false]
                         killItem.target = self
                         killItem.isEnabled = true
                         submenu.addItem(killItem)
 
-                        let forceKillItem = NSMenuItem(title: "Force Quit \(name)", action: #selector(killProcess(_:)), keyEquivalent: "")
-                        forceKillItem.representedObject = ["pid": pid, "force": true]
+                        let forceKillItem = NSMenuItem(title: "Force Quit \(process.name)", action: #selector(killProcess(_:)), keyEquivalent: "")
+                        forceKillItem.representedObject = ["pid": process.pid, "force": true]
                         forceKillItem.target = self
                         forceKillItem.isEnabled = true
                         submenu.addItem(forceKillItem)
 
-                        let hideItem = NSMenuItem(title: "Hide \"\(name)\"", action: #selector(hideProcess(_:)), keyEquivalent: "")
-                        hideItem.representedObject = name
+                        let hideItem = NSMenuItem(title: "Hide \"\(process.name)\"", action: #selector(hideProcess(_:)), keyEquivalent: "")
+                        hideItem.representedObject = process.name
                         hideItem.target = self
                         hideItem.isEnabled = true
                         hideItem.toolTip = "Hide every process with this name from the menu"
@@ -359,7 +388,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                         if processesOnPort.count > 1,
                            let last = processesOnPort.last,
-                           (name != last.name || pid != last.pid) {
+                           (process.name != last.name || process.pid != last.pid) {
                             submenu.addItem(NSMenuItem.separator())
                         }
                     }

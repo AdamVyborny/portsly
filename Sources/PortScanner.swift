@@ -16,6 +16,8 @@ struct ProcessInfo {
     let ports: [Int]
     let workingDirectory: String?
     let icon: NSImage?
+    let gitBranch: String?
+    let gitWorktree: String?
 }
 
 class PortScanner {
@@ -35,6 +37,16 @@ class PortScanner {
     }()
 
     private let iconCacheIOQueue = DispatchQueue(label: "dev.brightbase.portsly.iconCacheIO", qos: .utility)
+
+    // Per-scan cache, cleared at the start of each scanPorts. Nil sentinel means
+    // "we already looked and there's no git repo here" — preserving negative
+    // results avoids re-walking the tree for non-repo paths.
+    private var gitInfoCache: [String: GitRefInfo?] = [:]
+
+    private struct GitRefInfo {
+        let branch: String?
+        let worktree: String?
+    }
 
     init() {
         loadIconCacheFromDisk()
@@ -229,6 +241,7 @@ class PortScanner {
 
     func scanPorts(showSystemProcesses: Bool = false) -> [ProcessInfo] {
         let startTime = Date()
+        gitInfoCache.removeAll(keepingCapacity: true)
         var processMap: [Int: (name: String, fullCommand: String?, ports: Set<Int>, workingDirectory: String?, icon: NSImage?)] = [:]
         var dockerContainerMap: [String: (pid: Int, ports: Set<Int>, workingDirectory: String?, icon: NSImage?)] = [:]
         var dockerPorts: [Int: String] = [:] // Map of port to container name for Docker
@@ -498,12 +511,34 @@ class PortScanner {
         }
 
         // Combine regular processes and Docker containers
-        var allProcesses = processMap.map { pid, info in
-            ProcessInfo(pid: pid, name: info.name, fullCommand: info.fullCommand, ports: Array(info.ports).sorted(), workingDirectory: info.workingDirectory, icon: pidToIcon[pid] ?? nil)
+        var allProcesses: [ProcessInfo] = processMap.map { pid, info in
+            let git = gitBranchInfo(forDirectory: info.workingDirectory)
+            return ProcessInfo(
+                pid: pid,
+                name: info.name,
+                fullCommand: info.fullCommand,
+                ports: Array(info.ports).sorted(),
+                workingDirectory: info.workingDirectory,
+                icon: pidToIcon[pid] ?? nil,
+                gitBranch: git?.branch,
+                gitWorktree: git?.worktree
+            )
         }
 
+        // Docker containers intentionally skip git lookup — the working directory
+        // reported here is the docker daemon's cwd, not the container's, so any
+        // branch we attached would just be noise from wherever Docker was started.
         allProcesses += dockerContainerMap.map { containerName, info in
-            ProcessInfo(pid: info.pid, name: containerName, fullCommand: nil, ports: Array(info.ports).sorted(), workingDirectory: info.workingDirectory, icon: pidToIcon[info.pid] ?? nil)
+            ProcessInfo(
+                pid: info.pid,
+                name: containerName,
+                fullCommand: nil,
+                ports: Array(info.ports).sorted(),
+                workingDirectory: info.workingDirectory,
+                icon: pidToIcon[info.pid] ?? nil,
+                gitBranch: nil,
+                gitWorktree: nil
+            )
         }
 
         let result: [ProcessInfo]
@@ -529,6 +564,86 @@ class PortScanner {
     func killProcess(pid: Int, force: Bool = false) -> Bool {
         let signal: Int32 = force ? SIGKILL : SIGTERM
         return Darwin.kill(pid_t(pid), signal) == 0
+    }
+
+    private func gitBranchInfo(forDirectory directory: String?) -> (branch: String?, worktree: String?)? {
+        guard let directory = directory else { return nil }
+        let expanded = directory.replacingOccurrences(of: "~", with: NSHomeDirectory())
+
+        if let cached = gitInfoCache[expanded] {
+            guard let info = cached else { return nil }
+            return (branch: info.branch, worktree: info.worktree)
+        }
+
+        let result = computeGitRefInfo(forExpandedDir: expanded)
+        gitInfoCache[expanded] = result
+        guard let info = result else { return nil }
+        return (branch: info.branch, worktree: info.worktree)
+    }
+
+    private func computeGitRefInfo(forExpandedDir directory: String) -> GitRefInfo? {
+        let fm = FileManager.default
+
+        // Walk up until we find a .git entry (directory for a normal clone, file for a worktree/submodule).
+        var current = directory
+        var gitEntry: String? = nil
+        var gitEntryIsDirectory = false
+
+        while !current.isEmpty && current != "/" {
+            let candidate = current + "/.git"
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: candidate, isDirectory: &isDir) {
+                gitEntry = candidate
+                gitEntryIsDirectory = isDir.boolValue
+                break
+            }
+            let parent = (current as NSString).deletingLastPathComponent
+            if parent == current { break }
+            current = parent
+        }
+
+        guard let entry = gitEntry else { return nil }
+
+        var gitDir = entry
+        var worktree: String? = nil
+
+        if !gitEntryIsDirectory {
+            // .git is a file pointing at the real gitdir. For worktrees that path
+            // contains "/worktrees/<name>"; for submodules it's "/modules/<name>".
+            // Only surface the name when it's actually a worktree.
+            guard let data = fm.contents(atPath: entry),
+                  let content = String(data: data, encoding: .utf8) else {
+                return nil
+            }
+            let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let range = trimmed.range(of: "gitdir:") else { return nil }
+            gitDir = String(trimmed[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+            if gitDir.contains("/worktrees/") {
+                worktree = (gitDir as NSString).lastPathComponent
+            }
+        }
+
+        let headPath = gitDir + "/HEAD"
+        guard let headData = fm.contents(atPath: headPath),
+              let headText = String(data: headData, encoding: .utf8) else {
+            if worktree != nil { return GitRefInfo(branch: nil, worktree: worktree) }
+            return nil
+        }
+
+        let head = headText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let branch: String?
+        if head.hasPrefix("ref: refs/heads/") {
+            branch = String(head.dropFirst("ref: refs/heads/".count))
+        } else if head.hasPrefix("ref: ") {
+            branch = String(head.dropFirst("ref: ".count))
+        } else if !head.isEmpty {
+            branch = String(head.prefix(7))
+        } else {
+            branch = nil
+        }
+
+        if branch == nil && worktree == nil { return nil }
+        return GitRefInfo(branch: branch, worktree: worktree)
     }
 
     private func getEnhancedProcessNameFromArgs(baseName: String, fullName: String, psOutput: String, workingDirectory: String? = nil) -> String {

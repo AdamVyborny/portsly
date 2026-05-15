@@ -7,6 +7,7 @@
 
 import Foundation
 import AppKit
+import Darwin
 
 struct ProcessInfo {
     let pid: Int
@@ -23,6 +24,52 @@ class PortScanner {
 
     // Debug flag for timing logs
     private let debugTiming = true
+
+    // On-disk persistence for the icon cache so it survives app restarts
+    private let iconCacheDirectory: URL = {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support")
+        let dir = appSupport.appendingPathComponent("Portsly").appendingPathComponent("iconCache")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    private let iconCacheIOQueue = DispatchQueue(label: "dev.brightbase.portsly.iconCacheIO", qos: .utility)
+
+    init() {
+        loadIconCacheFromDisk()
+    }
+
+    private func loadIconCacheFromDisk() {
+        guard let entries = try? FileManager.default.contentsOfDirectory(at: iconCacheDirectory, includingPropertiesForKeys: nil) else { return }
+        for url in entries where url.pathExtension == "png" {
+            let name = url.deletingPathExtension().lastPathComponent
+            if let image = NSImage(contentsOf: url) {
+                image.size = NSSize(width: 16, height: 16)
+                iconCache[name] = image
+            }
+        }
+    }
+
+    private func saveIconToCache(_ image: NSImage, forName name: String) {
+        iconCache[name] = image
+        // Only persist names that are safe to use as a filename directly
+        guard isFilenameSafe(name) else { return }
+        let dir = iconCacheDirectory
+        iconCacheIOQueue.async {
+            guard let tiff = image.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff),
+                  let pngData = rep.representation(using: .png, properties: [:]) else { return }
+            let url = dir.appendingPathComponent(name + ".png")
+            try? pngData.write(to: url)
+        }
+    }
+
+    private func isFilenameSafe(_ name: String) -> Bool {
+        if name.isEmpty || name.hasPrefix(".") { return false }
+        let unsafe = CharacterSet(charactersIn: "/\\:*?\"<>|\0")
+        return name.rangeOfCharacter(from: unsafe) == nil
+    }
 
     // Common development process patterns
     private let devProcessPatterns = [
@@ -186,61 +233,98 @@ class PortScanner {
         var dockerContainerMap: [String: (pid: Int, ports: Set<Int>, workingDirectory: String?, icon: NSImage?)] = [:]
         var dockerPorts: [Int: String] = [:] // Map of port to container name for Docker
 
-        let lsofOutput = shell("lsof -iTCP -sTCP:LISTEN -n -P")
-
+        // Stage 1: list listening sockets (gates everything else)
+        let lsofOutput = run("/usr/sbin/lsof", ["-iTCP", "-sTCP:LISTEN", "-n", "-P"])
         let lines = lsofOutput.components(separatedBy: .newlines)
 
-        // Collect all unique PIDs first
+        // Walk the output once to collect PIDs and detect docker presence
         var allPids = Set<Int>()
+        var hasDockerProcess = false
         for line in lines {
             let components = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
             if components.count >= 10, let pid = Int(components[1]) {
                 allPids.insert(pid)
+                if components[0] == "com.docke" {
+                    hasDockerProcess = true
+                }
             }
         }
 
-        // Batch get all process names
+        // Stage 2: parallel batch fetches that all depend only on the PID set
         var pidToFullName: [Int: String] = [:]
-        if !allPids.isEmpty {
-            let pidsStr = allPids.map { String($0) }.joined(separator: ",")
-            let psOutput = shell("ps -p \(pidsStr) -o pid,comm")
-
-            for line in psOutput.components(separatedBy: .newlines).dropFirst() {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.isEmpty { continue }
-
-                if let spaceIndex = trimmed.firstIndex(of: " ") {
-                    let pidStr = String(trimmed[..<spaceIndex])
-                    if let pid = Int(pidStr) {
-                        let comm = String(trimmed[trimmed.index(after: spaceIndex)...]).trimmingCharacters(in: .whitespaces)
-                        pidToFullName[pid] = comm.components(separatedBy: "/").last ?? comm
-                    }
-                }
-            }
-        }
-
-        // Batch get all working directories
         var pidToWorkingDir: [Int: String] = [:]
-        if !allPids.isEmpty {
-            let lsofCwdOutput = shell("lsof -a -d cwd -p \(allPids.map { String($0) }.joined(separator: ","))")
+        var pidToArgs: [Int: String] = [:]
+        var dockerInfo: [(container: String, ports: String)] = []
 
-            for line in lsofCwdOutput.components(separatedBy: .newlines) {
-                let components = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-                if components.count >= 9, let pid = Int(components[1]) {
-                    let path = components[8...].joined(separator: " ")
-                    if let homeDir = Foundation.ProcessInfo.processInfo.environment["HOME"] {
-                        pidToWorkingDir[pid] = path.replacingOccurrences(of: homeDir, with: "~")
-                    } else {
-                        pidToWorkingDir[pid] = path
+        if !allPids.isEmpty {
+            let pidsArg = allPids.map { String($0) }.joined(separator: ",")
+            let group = DispatchGroup()
+            let queue = DispatchQueue.global(qos: .userInitiated)
+
+            group.enter()
+            queue.async {
+                let out = self.run("/bin/ps", ["-p", pidsArg, "-o", "pid,comm"])
+                for line in out.components(separatedBy: .newlines).dropFirst() {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    if trimmed.isEmpty { continue }
+                    if let spaceIndex = trimmed.firstIndex(of: " ") {
+                        let pidStr = String(trimmed[..<spaceIndex])
+                        if let pid = Int(pidStr) {
+                            let comm = String(trimmed[trimmed.index(after: spaceIndex)...]).trimmingCharacters(in: .whitespaces)
+                            pidToFullName[pid] = comm.components(separatedBy: "/").last ?? comm
+                        }
                     }
                 }
+                group.leave()
             }
+
+            group.enter()
+            queue.async {
+                let out = self.run("/usr/sbin/lsof", ["-a", "-d", "cwd", "-p", pidsArg])
+                for line in out.components(separatedBy: .newlines) {
+                    let components = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                    if components.count >= 9, let pid = Int(components[1]) {
+                        let path = components[8...].joined(separator: " ")
+                        if let homeDir = Foundation.ProcessInfo.processInfo.environment["HOME"] {
+                            pidToWorkingDir[pid] = path.replacingOccurrences(of: homeDir, with: "~")
+                        } else {
+                            pidToWorkingDir[pid] = path
+                        }
+                    }
+                }
+                group.leave()
+            }
+
+            group.enter()
+            queue.async {
+                let out = self.run("/bin/ps", ["-p", pidsArg, "-o", "pid,args"])
+                for line in out.components(separatedBy: .newlines).dropFirst() {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    if trimmed.isEmpty { continue }
+                    if let spaceIndex = trimmed.firstIndex(of: " ") {
+                        let pidStr = String(trimmed[..<spaceIndex])
+                        if let pid = Int(pidStr) {
+                            let args = String(trimmed[trimmed.index(after: spaceIndex)...]).trimmingCharacters(in: .whitespaces)
+                            pidToArgs[pid] = args
+                        }
+                    }
+                }
+                group.leave()
+            }
+
+            // Only consult Docker if at least one listener actually belongs to it
+            if hasDockerProcess {
+                group.enter()
+                queue.async {
+                    dockerInfo = self.getDockerInfo()
+                    group.leave()
+                }
+            }
+
+            group.wait()
         }
 
-        // Get all Docker container info in one call
-        let dockerInfo = getDockerInfo()
-
-        // First pass: identify all Docker ports and their containers
+        // First pass: map docker ports to container names using the docker info we fetched
         for line in lines {
             let components = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
             guard components.count >= 10 else { continue }
@@ -252,9 +336,7 @@ class PortScanner {
             if let portRange = portInfo.split(separator: ":").last,
                let port = Int(portRange.split(separator: "-").first ?? portRange) {
 
-                // Check if this is a Docker process - lsof truncates to "com.docke"
                 if processName == "com.docke" {
-                    // Find container with this port
                     for (container, ports) in dockerInfo {
                         if ports.contains(":\(port)->") || ports.contains("0.0.0.0:\(port)->") {
                             dockerPorts[port] = container
@@ -265,8 +347,7 @@ class PortScanner {
             }
         }
 
-
-        // Second pass: build the process map
+        // Second pass: build the process map (names already enhanced from ps args)
         for line in lines {
             let components = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
             guard components.count >= 10 else { continue }
@@ -278,7 +359,6 @@ class PortScanner {
             if let portRange = portInfo.split(separator: ":").last,
                let port = Int(portRange.split(separator: "-").first ?? portRange) {
 
-                // Check if this is a Docker process - lsof truncates to "com.docke"
                 if processName == "com.docke" {
                     let containerName = dockerPorts[port] ?? "Docker Desktop"
                     let containerKey = "docker: \(containerName)"
@@ -289,74 +369,36 @@ class PortScanner {
                     }
                     dockerContainerMap[containerKey]?.ports.insert(port)
                 } else {
-                    // Non-Docker processes work as before
                     if processMap[pid] == nil {
                         let fullName = pidToFullName[pid] ?? processName
                         let workingDir = pidToWorkingDir[pid]
-                        // For now, just use the full name - we'll enhance it in a batch later
-                        processMap[pid] = (name: fullName, fullCommand: nil, ports: Set<Int>(), workingDirectory: workingDir, icon: nil)
+                        let args = pidToArgs[pid]
+                        let enhancedName: String
+                        if let args = args {
+                            enhancedName = getEnhancedProcessNameFromArgs(
+                                baseName: fullName,
+                                fullName: fullName,
+                                psOutput: args,
+                                workingDirectory: workingDir
+                            )
+                        } else {
+                            enhancedName = fullName
+                        }
+                        processMap[pid] = (name: enhancedName, fullCommand: args, ports: Set<Int>(), workingDirectory: workingDir, icon: nil)
                     }
                     processMap[pid]?.ports.insert(port)
                 }
             }
         }
 
-
-        // Batch enhance process names
-        var enhancedProcessMap = processMap
-
-        // Get all ps args in one batch call
-        let nonDockerPids = processMap.keys.filter { pid in
-            let name = processMap[pid]?.name ?? ""
-            return !name.contains("docker") && !name.contains("com.docker")
-        }
-
-        if !nonDockerPids.isEmpty {
-            let pidsStr = nonDockerPids.map { String($0) }.joined(separator: ",")
-            let psArgsOutput = shell("ps -p \(pidsStr) -o pid,args")
-
-            var pidToArgs: [Int: String] = [:]
-            for line in psArgsOutput.components(separatedBy: .newlines).dropFirst() {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.isEmpty { continue }
-
-                if let spaceIndex = trimmed.firstIndex(of: " ") {
-                    let pidStr = String(trimmed[..<spaceIndex])
-                    if let pid = Int(pidStr) {
-                        let args = String(trimmed[trimmed.index(after: spaceIndex)...]).trimmingCharacters(in: .whitespaces)
-                        pidToArgs[pid] = args
-                    }
-                }
-            }
-
-            // Now enhance names based on args
-            for (pid, info) in processMap {
-                if let args = pidToArgs[pid] {
-                    let enhancedName = getEnhancedProcessNameFromArgs(
-                        baseName: info.name,
-                        fullName: info.name,
-                        psOutput: args,
-                        workingDirectory: info.workingDirectory
-                    )
-                    enhancedProcessMap[pid]?.name = enhancedName
-                    enhancedProcessMap[pid]?.fullCommand = args
-                }
-            }
-        }
-
-        processMap = enhancedProcessMap
-
-        // Get icons for all unique processes
+        // Icon lookup. Group PIDs by name so we only resolve each name once.
         var pidToIcon: [Int: NSImage?] = [:]
-
-        // First, group PIDs by process name to avoid duplicate icon lookups
         var processNameToPids: [String: [Int]] = [:]
         for (pid, info) in processMap {
-            // Skip icon loading for system processes if they're going to be filtered out
+            // Skip icon work for processes that won't be displayed anyway
             if !showSystemProcesses && isSystemProcess(info.name) {
                 continue
             }
-
             let baseName = info.name.components(separatedBy: ":").first ?? info.name
             if processNameToPids[baseName] == nil {
                 processNameToPids[baseName] = []
@@ -364,9 +406,8 @@ class PortScanner {
             processNameToPids[baseName]?.append(pid)
         }
 
-        // Get icon for each unique process name using a more efficient approach
         for (processName, pids) in processNameToPids {
-            // Check cache first
+            // Memory cache (already includes anything loaded from disk at init)
             if let cachedIcon = iconCache[processName] {
                 for pid in pids {
                     pidToIcon[pid] = cachedIcon
@@ -374,14 +415,14 @@ class PortScanner {
                 continue
             }
 
-            // Skip icon loading for known command-line tools
+            // Known CLI tools have no useful GUI icon
             let lowerName = processName.lowercased()
             if lowerName == "node" || lowerName.contains("python") || lowerName == "java" ||
                lowerName == "ruby" || lowerName == "go" || lowerName == "rust" || lowerName == "php" {
                 continue
             }
 
-            // Try to get icon using NSRunningApplication (fast for GUI apps)
+            // Fast path: NSRunningApplication (in-process workspace lookup)
             var icon: NSImage?
             for pid in pids {
                 if let app = NSRunningApplication(processIdentifier: pid_t(pid)) {
@@ -393,29 +434,33 @@ class PortScanner {
                 }
             }
 
-            // If no icon found and it looks like it might be an app, try one targeted lsof call
-            if icon == nil && !processName.contains(".") && !processName.contains("/") {
+            // Slow path: only worth attempting for processes that could plausibly
+            // be wrapped in a .app bundle. Daemons matched by isSystemProcess never are.
+            if icon == nil
+                && !processName.contains(".")
+                && !processName.contains("/")
+                && !isSystemProcess(processName) {
                 if let firstPid = pids.first {
-                    // Single pid lookup is much faster than batch
-                    let appPath = shell("lsof -p \(firstPid) | grep -E '\\.app/Contents/MacOS' | head -1").trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !appPath.isEmpty {
-                        if let appRange = appPath.range(of: #"(/[^:]+\.app)/Contents/MacOS"#, options: .regularExpression) {
-                            let appBundlePath = String(appPath[appRange]).replacingOccurrences(of: "/Contents/MacOS", with: "")
-                            icon = getProcessIconFromAppPath(appPath: appBundlePath)
-                        }
+                    // `-d txt` limits lsof to the executable text descriptor — orders of
+                    // magnitude faster than dumping every open fd for the process.
+                    let txtOutput = run("/usr/sbin/lsof", ["-p", String(firstPid), "-d", "txt"])
+                    if let line = txtOutput.components(separatedBy: .newlines).first(where: { $0.contains(".app/Contents/MacOS") }),
+                       let appRange = line.range(of: #"(/[^:]+\.app)/Contents/MacOS"#, options: .regularExpression) {
+                        let appBundlePath = String(line[appRange]).replacingOccurrences(of: "/Contents/MacOS", with: "")
+                        icon = getProcessIconFromAppPath(appPath: appBundlePath)
                     }
                 }
             }
 
             if let icon = icon {
-                iconCache[processName] = icon
+                saveIconToCache(icon, forName: processName)
                 for pid in pids {
                     pidToIcon[pid] = icon
                 }
             }
         }
 
-        // Handle Docker containers separately (they all have the same icon)
+        // Docker containers all share one icon
         if !dockerContainerMap.isEmpty {
             let dockerPids = Set(dockerContainerMap.values.map { $0.pid })
             if let dockerPid = dockerPids.first {
@@ -424,45 +469,39 @@ class PortScanner {
                         pidToIcon[pid] = cachedIcon
                     }
                 } else {
-                    // Try to get Docker icon using NSRunningApplication
+                    var dockerIcon: NSImage?
                     if let app = NSRunningApplication(processIdentifier: pid_t(dockerPid)) {
-                        let icon = app.icon
-                        icon?.size = NSSize(width: 16, height: 16)
-                        iconCache["Docker"] = icon
-                        for pid in dockerPids {
-                            pidToIcon[pid] = icon
-                        }
-                    } else {
-                        // Try to find Docker app icon
+                        dockerIcon = app.icon
+                        dockerIcon?.size = NSSize(width: 16, height: 16)
+                    }
+                    if dockerIcon == nil {
                         let dockerAppPaths = [
                             "/Applications/Docker.app",
                             "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Docker.app",
                             NSHomeDirectory() + "/Applications/Docker.app"
                         ]
-
-                        for path in dockerAppPaths {
-                            if FileManager.default.fileExists(atPath: path) {
-                                let icon = NSWorkspace.shared.icon(forFile: path)
-                                icon.size = NSSize(width: 16, height: 16)
-                                iconCache["Docker"] = icon
-                                for pid in dockerPids {
-                                    pidToIcon[pid] = icon
-                                }
-                                break
-                            }
+                        for path in dockerAppPaths where FileManager.default.fileExists(atPath: path) {
+                            let icon = NSWorkspace.shared.icon(forFile: path)
+                            icon.size = NSSize(width: 16, height: 16)
+                            dockerIcon = icon
+                            break
+                        }
+                    }
+                    if let dockerIcon = dockerIcon {
+                        saveIconToCache(dockerIcon, forName: "Docker")
+                        for pid in dockerPids {
+                            pidToIcon[pid] = dockerIcon
                         }
                     }
                 }
             }
         }
 
-
         // Combine regular processes and Docker containers
         var allProcesses = processMap.map { pid, info in
             ProcessInfo(pid: pid, name: info.name, fullCommand: info.fullCommand, ports: Array(info.ports).sorted(), workingDirectory: info.workingDirectory, icon: pidToIcon[pid] ?? nil)
         }
 
-        // Add Docker containers as separate ProcessInfo entries
         allProcesses += dockerContainerMap.map { containerName, info in
             ProcessInfo(pid: info.pid, name: containerName, fullCommand: nil, ports: Array(info.ports).sorted(), workingDirectory: info.workingDirectory, icon: pidToIcon[info.pid] ?? nil)
         }
@@ -488,9 +527,8 @@ class PortScanner {
     }
 
     func killProcess(pid: Int, force: Bool = false) -> Bool {
-        let signal = force ? "-9" : "-15"
-        let result = shell("kill \(signal) \(pid)")
-        return result.isEmpty
+        let signal: Int32 = force ? SIGKILL : SIGTERM
+        return Darwin.kill(pid_t(pid), signal) == 0
     }
 
     private func getEnhancedProcessNameFromArgs(baseName: String, fullName: String, psOutput: String, workingDirectory: String? = nil) -> String {
@@ -715,7 +753,7 @@ class PortScanner {
     }
 
 
-    private func shell(_ command: String) -> String {
+    private func shell(_ command: String, timeout: TimeInterval? = nil) -> String {
         let startTime = debugTiming ? Date() : nil
 
         let task = Process()
@@ -729,11 +767,20 @@ class PortScanner {
 
         // Add PATH to ensure docker command is found
         var env = Foundation.ProcessInfo.processInfo.environment
-        env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
         task.environment = env
 
         do {
             try task.run()
+
+            if let timeout = timeout {
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    if task.isRunning {
+                        task.terminate()
+                    }
+                }
+            }
+
             task.waitUntilExit()
 
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -751,15 +798,60 @@ class PortScanner {
         }
     }
 
+    // Direct-exec variant — no shell layer. Use when no pipes/redirects needed.
+    private func run(_ launchPath: String, _ arguments: [String], timeout: TimeInterval? = nil) -> String {
+        let startTime = debugTiming ? Date() : nil
+
+        let task = Process()
+        let pipe = Pipe()
+
+        task.standardOutput = pipe
+        task.standardError = pipe
+        task.launchPath = launchPath
+        task.arguments = arguments
+        task.standardInput = nil
+
+        var env = Foundation.ProcessInfo.processInfo.environment
+        env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+        task.environment = env
+
+        do {
+            try task.run()
+
+            if let timeout = timeout {
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    if task.isRunning {
+                        task.terminate()
+                    }
+                }
+            }
+
+            task.waitUntilExit()
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let result = String(data: data, encoding: .utf8) ?? ""
+
+            if let startTime = startTime {
+                let elapsedMs = Date().timeIntervalSince(startTime) * 1000
+                print(String(format: "[%.0fms] Portsly run: %@ %@", elapsedMs, launchPath, arguments.joined(separator: " ")))
+            }
+
+            return result
+        } catch {
+            return ""
+        }
+    }
+
 
     func getDockerInfo() -> [(container: String, ports: String)] {
-        // Check if Docker is available
-        let dockerCheckOutput = shell("which docker 2>/dev/null")
-        if dockerCheckOutput.isEmpty {
+        // Locate docker binary directly — much faster than `which docker`
+        let candidates = ["/usr/local/bin/docker", "/opt/homebrew/bin/docker"]
+        guard let dockerPath = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
             return []
         }
 
-        let dockerOutput = shell("docker ps --format '{{.Names}}: {{.Ports}}' 2>/dev/null")
+        // Hard timeout: if the daemon is unresponsive, never block the menu for it
+        let dockerOutput = run(dockerPath, ["ps", "--format", "{{.Names}}: {{.Ports}}"], timeout: 1.0)
 
         if dockerOutput.isEmpty {
             return []

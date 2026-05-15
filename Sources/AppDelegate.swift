@@ -14,6 +14,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var showOnlyDevProcesses = UserDefaults.standard.bool(forKey: "showOnlyDevProcesses")
     var cachedProcesses: [ProcessInfo] = []
 
+    private let scanQueue = DispatchQueue(label: "dev.brightbase.portsly.scan", qos: .userInitiated)
+    private var menuIsOpen = false
+    private var hasScannedAtLeastOnce = false
+
     private func createInfoMenuItem(title: String, value: String, font: NSFont, color: NSColor, maxLength: Int = 0) -> NSMenuItem {
         let text: String
         if maxLength > 0 && value.count > maxLength {
@@ -110,175 +114,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Create initial menu
         let menu = NSMenu()
         menu.delegate = self
+        menu.autoenablesItems = false
         statusItem?.menu = menu
+
+        // Pre-warm the cache so the first menu click is instant
+        refreshMenuAsync(rebuildIfOpen: false)
     }
 
-    func updateMenu() {
-        guard let menu = statusItem?.menu else { return }
-
+    private func refreshMenuAsync(rebuildIfOpen: Bool) {
         let startTime = Date()
-
-        // Clear existing items
-        menu.removeAllItems()
-        menu.autoenablesItems = false
-
-        let scanStart = Date()
-        // Cache all processes but filter based on showSystemProcesses
-        let allProcesses = portScanner.scanPorts(showSystemProcesses: true)
-        cachedProcesses = allProcesses
-
-        let processes: [ProcessInfo]
-        if showOnlyDevProcesses {
-            processes = allProcesses.filter { portScanner.isDevProcess($0) }
-        } else if showSystemProcesses {
-            processes = allProcesses
-        } else {
-            processes = allProcesses.filter { !portScanner.isSystemProcess($0.name) }
-        }
-        _ = Date().timeIntervalSince(scanStart)
-        // if debugTiming { print("Portsly: Port scanning took \(scanTime)s") }
-
-        if processes.isEmpty {
-            let item = NSMenuItem(title: "No applications listening on ports", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        } else {
-            // Create a map of ports to processes for easier lookup
-            var portToProcesses: [Int: [(name: String, pid: Int, workingDirectory: String?, fullCommand: String?)]] = [:]
-
-            for process in processes {
-                for port in process.ports {
-                    if portToProcesses[port] == nil {
-                        portToProcesses[port] = []
-                    }
-                    portToProcesses[port]?.append((name: process.name, pid: process.pid, workingDirectory: process.workingDirectory, fullCommand: process.fullCommand))
+        scanQueue.async { [weak self] in
+            guard let self = self else { return }
+            let processes = self.portScanner.scanPorts(showSystemProcesses: true)
+            DispatchQueue.main.async {
+                self.cachedProcesses = processes
+                self.hasScannedAtLeastOnce = true
+                if rebuildIfOpen && self.menuIsOpen {
+                    self.filterAndUpdateMenu()
                 }
-            }
-
-            // Sort ports and create menu items
-            let sortedPorts = portToProcesses.keys.sorted()
-
-            for port in sortedPorts {
-                guard let processesOnPort = portToProcesses[port] else { continue }
-
-                // Format the menu item with port on left, process name(s) on right
-                let processNames = processesOnPort.map { $0.name }.joined(separator: ", ")
-                let title = String(format: "%-8d %@", port, processNames)
-
-                let portItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-                // Use attributed title for monospaced font
-                let attributes: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-                ]
-                portItem.attributedTitle = NSAttributedString(string: title, attributes: attributes)
-
-                // Set icon if we have one (use the first process's icon)
-                if let firstProcess = processes.first(where: { $0.ports.contains(port) }),
-                   let icon = firstProcess.icon {
-                    portItem.image = icon
-                } else {
-                    // Create a blank icon for alignment
-                    let blankIcon = NSImage(size: NSSize(width: 16, height: 16))
-                    blankIcon.lockFocus()
-                    NSColor.clear.set()
-                    NSRect(x: 0, y: 0, width: 16, height: 16).fill()
-                    blankIcon.unlockFocus()
-                    portItem.image = blankIcon
-                }
-
-                // If multiple processes on same port, or user wants to see details
-                if processesOnPort.count > 1 || true {  // Always show submenu for consistency
-                    let submenu = NSMenu()
-                    submenu.autoenablesItems = false
-
-                    // Add "Open in Browser" at the top
-                    let openItem = NSMenuItem(title: "Open in Browser", action: #selector(openInBrowser(_:)), keyEquivalent: "")
-                    openItem.representedObject = port
-                    openItem.target = self
-                    openItem.isEnabled = true
-                    submenu.addItem(openItem)
-
-                    submenu.addItem(NSMenuItem.separator())
-
-                    for (name, pid, workingDirectory, fullCommand) in processesOnPort {
-                        submenu.addItem(createInfoMenuItem(
-                            title: "PID",
-                            value: String(pid),
-                            font: .systemFont(ofSize: 12),
-                            color: .secondaryLabelColor
-                        ))
-
-                        if let cwd = workingDirectory {
-                            submenu.addItem(createInfoMenuItem(
-                                title: "Directory",
-                                value: cwd,
-                                font: .monospacedSystemFont(ofSize: 12, weight: .regular),
-                                color: .secondaryLabelColor
-                            ))
-                        }
-
-                        if let cmd = fullCommand {
-                            submenu.addItem(createInfoMenuItem(
-                                title: "Command",
-                                value: cmd,
-                                font: .monospacedSystemFont(ofSize: 12, weight: .regular),
-                                color: .secondaryLabelColor,
-                                maxLength: 50
-                            ))
-                        }
-
-                        let killItem = NSMenuItem(title: "Kill \(name)", action: #selector(killProcess(_:)), keyEquivalent: "")
-                        killItem.representedObject = ["pid": pid, "force": false]
-                        killItem.target = self
-                        killItem.isEnabled = true
-                        submenu.addItem(killItem)
-
-                        let forceKillItem = NSMenuItem(title: "Force Quit \(name)", action: #selector(killProcess(_:)), keyEquivalent: "")
-                        forceKillItem.representedObject = ["pid": pid, "force": true]
-                        forceKillItem.target = self
-                        forceKillItem.isEnabled = true
-                        submenu.addItem(forceKillItem)
-
-                        if processesOnPort.count > 1,
-                           let last = processesOnPort.last,
-                           (name != last.name || pid != last.pid) {
-                            submenu.addItem(NSMenuItem.separator())
-                        }
-                    }
-
-                    portItem.submenu = submenu
-                }
-
-                menu.addItem(portItem)
+                let totalTimeMs = Date().timeIntervalSince(startTime) * 1000
+                print(String(format: "[%.0fms] Portsly: refreshMenuAsync end-to-end", totalTimeMs))
             }
         }
-
-        menu.addItem(NSMenuItem.separator())
-
-        let devToggleItem = NSMenuItem(title: "Show Only Dev Processes",
-                                   action: #selector(toggleDevProcesses),
-                                   keyEquivalent: "")
-        devToggleItem.target = self
-        devToggleItem.isEnabled = true
-        devToggleItem.state = showOnlyDevProcesses ? .on : .off
-        menu.addItem(devToggleItem)
-
-        let systemToggleItem = NSMenuItem(title: "Show System Processes",
-                                   action: #selector(toggleSystemProcesses),
-                                   keyEquivalent: "")
-        systemToggleItem.target = self
-        systemToggleItem.isEnabled = true
-        systemToggleItem.state = showSystemProcesses ? .on : .off
-        menu.addItem(systemToggleItem)
-
-        menu.addItem(NSMenuItem.separator())
-
-        let quitItem = NSMenuItem(title: "Quit Portsly", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quitItem)
-
-        let totalTime = Date().timeIntervalSince(startTime)
-        let totalTimeMs = totalTime * 1000
-        print(String(format: "[%.0fms] Portsly: Total menu update", totalTimeMs))
     }
 
     @objc func killProcess(_ sender: NSMenuItem) {
@@ -295,7 +152,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if alert.runModal() == .alertFirstButtonReturn {
             if portScanner.killProcess(pid: pid, force: force) {
-                updateMenu()
+                refreshMenuAsync(rebuildIfOpen: false)
             } else {
                 let errorAlert = NSAlert()
                 errorAlert.messageText = "Failed to \(force ? "force quit" : "kill") process"
@@ -514,6 +371,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - NSMenuDelegate
 
     func menuWillOpen(_ menu: NSMenu) {
-        updateMenu()
+        menuIsOpen = true
+
+        if !hasScannedAtLeastOnce {
+            // First-ever click before the pre-warm scan finished: show a placeholder
+            // and rebuild the menu when the scan returns.
+            menu.removeAllItems()
+            let loading = NSMenuItem(title: "Loading…", action: nil, keyEquivalent: "")
+            loading.isEnabled = false
+            menu.addItem(loading)
+            refreshMenuAsync(rebuildIfOpen: true)
+        } else {
+            // Show the cached menu instantly; quietly refresh for next time.
+            filterAndUpdateMenu()
+            refreshMenuAsync(rebuildIfOpen: false)
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
     }
 }

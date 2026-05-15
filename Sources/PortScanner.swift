@@ -781,9 +781,12 @@ class PortScanner {
                 }
             }
 
-            task.waitUntilExit()
-
+            // Drain the pipe before waitUntilExit. macOS pipe buffers are 64KB —
+            // children that print more than that block on write, which would
+            // deadlock the wait below. readDataToEndOfFile returns when the
+            // child closes its end (i.e. exits or is terminated).
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
             let result = String(data: data, encoding: .utf8) ?? ""
 
             if let startTime = startTime {
@@ -826,9 +829,12 @@ class PortScanner {
                 }
             }
 
-            task.waitUntilExit()
-
+            // Drain the pipe before waitUntilExit. macOS pipe buffers are 64KB —
+            // children that print more than that block on write, which would
+            // deadlock the wait below. readDataToEndOfFile returns when the
+            // child closes its end (i.e. exits or is terminated).
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
             let result = String(data: data, encoding: .utf8) ?? ""
 
             if let startTime = startTime {

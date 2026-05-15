@@ -12,6 +12,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let portScanner = PortScanner()
     var showSystemProcesses = UserDefaults.standard.bool(forKey: "showSystemProcesses")
     var showOnlyDevProcesses = UserDefaults.standard.bool(forKey: "showOnlyDevProcesses")
+    var hiddenProcessNames: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "hiddenProcessNames") ?? [])
     var cachedProcesses: [ProcessInfo] = []
 
     private let scanQueue = DispatchQueue(label: "dev.brightbase.portsly.scan", qos: .userInitiated)
@@ -179,6 +180,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         filterAndUpdateMenu()
     }
 
+    @objc func hideProcess(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String, !name.isEmpty else { return }
+        hiddenProcessNames.insert(name)
+        persistHiddenProcessNames()
+        filterAndUpdateMenu()
+    }
+
+    @objc func unhideProcess(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        hiddenProcessNames.remove(name)
+        persistHiddenProcessNames()
+        filterAndUpdateMenu()
+    }
+
+    @objc func clearHiddenProcesses(_ sender: NSMenuItem) {
+        hiddenProcessNames.removeAll()
+        persistHiddenProcessNames()
+        filterAndUpdateMenu()
+    }
+
+    private func persistHiddenProcessNames() {
+        UserDefaults.standard.set(Array(hiddenProcessNames), forKey: "hiddenProcessNames")
+    }
+
     @objc func toggleDevProcesses(_ sender: NSMenuItem) {
         showOnlyDevProcesses.toggle()
         sender.state = showOnlyDevProcesses ? .on : .off
@@ -200,14 +225,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let menu = statusItem?.menu else { return }
 
         // Filter cached processes based on settings
-        let processes: [ProcessInfo]
+        let baseProcesses: [ProcessInfo]
         if showOnlyDevProcesses {
-            processes = cachedProcesses.filter { portScanner.isDevProcess($0) }
+            baseProcesses = cachedProcesses.filter { portScanner.isDevProcess($0) }
         } else if showSystemProcesses {
-            processes = cachedProcesses
+            baseProcesses = cachedProcesses
         } else {
-            processes = cachedProcesses.filter { !portScanner.isSystemProcess($0.name) }
+            baseProcesses = cachedProcesses.filter { !portScanner.isSystemProcess($0.name) }
         }
+
+        // User-hidden process names always take precedence over the toggles
+        let processes = hiddenProcessNames.isEmpty
+            ? baseProcesses
+            : baseProcesses.filter { !hiddenProcessNames.contains($0.name) }
 
         // Update menu with cached data (super fast)
         rebuildMenuWithProcesses(menu: menu, processes: processes)
@@ -320,6 +350,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         forceKillItem.isEnabled = true
                         submenu.addItem(forceKillItem)
 
+                        let hideItem = NSMenuItem(title: "Hide \"\(name)\"", action: #selector(hideProcess(_:)), keyEquivalent: "")
+                        hideItem.representedObject = name
+                        hideItem.target = self
+                        hideItem.isEnabled = true
+                        hideItem.toolTip = "Hide every process with this name from the menu"
+                        submenu.addItem(hideItem)
+
                         if processesOnPort.count > 1,
                            let last = processesOnPort.last,
                            (name != last.name || pid != last.pid) {
@@ -352,10 +389,47 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         systemToggleItem.state = showSystemProcesses ? .on : .off
         menu.addItem(systemToggleItem)
 
+        let hiddenItem = NSMenuItem(title: "Hidden Processes", action: nil, keyEquivalent: "")
+        if hiddenProcessNames.isEmpty {
+            hiddenItem.isEnabled = false
+            hiddenItem.toolTip = "Use the Hide action inside a port's submenu to add entries here"
+        } else {
+            hiddenItem.isEnabled = true
+            hiddenItem.submenu = buildHiddenProcessesSubmenu()
+        }
+        menu.addItem(hiddenItem)
+
         menu.addItem(NSMenuItem.separator())
 
         let quitItem = NSMenuItem(title: "Quit Portsly", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quitItem)
+    }
+
+    private func buildHiddenProcessesSubmenu() -> NSMenu {
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+
+        let header = NSMenuItem(title: "Click an entry to unhide", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        submenu.addItem(header)
+        submenu.addItem(NSMenuItem.separator())
+
+        for name in hiddenProcessNames.sorted() {
+            let item = NSMenuItem(title: name, action: #selector(unhideProcess(_:)), keyEquivalent: "")
+            item.representedObject = name
+            item.target = self
+            item.isEnabled = true
+            submenu.addItem(item)
+        }
+
+        submenu.addItem(NSMenuItem.separator())
+
+        let clearAll = NSMenuItem(title: "Unhide All", action: #selector(clearHiddenProcesses(_:)), keyEquivalent: "")
+        clearAll.target = self
+        clearAll.isEnabled = true
+        submenu.addItem(clearAll)
+
+        return submenu
     }
 
 
